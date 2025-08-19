@@ -1,0 +1,19 @@
+# FastAPI 서버 필수
+fastapi
+uvicorn
+
+# OCR 파이프라인 관련
+pdfplumber
+paddleocr
+paddlepaddle
+pdf2image
+PyPDF2
+opencv-python
+numpy
+
+# 빌드 툴 (설치 오류 방지용)
+setuptools
+wheel
+
+# 파일 업로드용
+python-multipart
