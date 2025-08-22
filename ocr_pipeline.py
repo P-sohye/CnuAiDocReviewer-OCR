@@ -20,7 +20,7 @@ POPPLER_BIN = r"C:\poppler-25.07.0\Library\bin"  # 필요 시 수정
 os.environ["PATH"] = POPPLER_BIN + os.pathsep + os.environ.get("PATH", "")
 
 # ===== 전역 상수 =====
-DPI = 200
+DPI = 150
 MIN_COUNT = 300  # 자소서 섹션 최소 길이 기준
 
 # ===== OCR 엔진 (서버 기동 시 1회 초기화) =====
