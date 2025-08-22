@@ -10,7 +10,8 @@ pdf2image
 PyPDF2
 opencv-python
 numpy
-
+pymupdf
+paddlepaddle-gpu
 # 빌드 툴 (설치 오류 방지용)
 setuptools
 wheel

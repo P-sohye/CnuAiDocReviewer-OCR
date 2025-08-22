@@ -23,19 +23,48 @@ os.environ["PATH"] = POPPLER_BIN + os.pathsep + os.environ.get("PATH", "")
 DPI = 150
 MIN_COUNT = 300  # 자소서 섹션 최소 길이 기준
 
-# ===== OCR 엔진 (서버 기동 시 1회 초기화) =====
-# - use_textline_orientation 는 버전에 따라 미지원 → use_angle_cls 권장
-# - cls=True 로 호출
-ocr = PaddleOCR(lang='korean', use_angle_cls=True, device='cpu')
+# ===== 런타임 설정 (ENV/인자로 제어) =====
+# - OCR_DEVICE: 'cpu' | 'gpu' (기본: 'cpu')
+# - LLM_ENABLED: '1' | '0' (기본: '0' — 속도 우선으로 비활성화)
+OCR_DEVICE_DEFAULT = os.getenv("OCR_DEVICE", "cpu").strip().lower()
+LLM_ENABLED_DEFAULT = os.getenv("LLM_ENABLED", "0").strip() == "1"
 
+# ===== OCR 엔진 (서버 기동 시 1회 초기화) =====
+# PaddleOCR는 새로운 버전에서 device='cpu'/'gpu' 지원.
+# (구버전이면 use_gpu=True/False 필요 → 하위호환 방어 처리 포함)
+def _init_ocr(device: str = OCR_DEVICE_DEFAULT) -> PaddleOCR:
+    device = device.lower()
+    common_kwargs = dict(
+        lang="korean",
+        use_angle_cls=True,
+        # ↓↓↓ PaddleX 기반 문서 전처리 비활성화 ↓↓↓
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+    )
+    try:
+        # 신형 API (device 파라미터 지원)
+        return PaddleOCR(lang="korean", use_angle_cls=True, device=("gpu" if device == "gpu" else "cpu"))
+    except TypeError:
+        # 구형 API 폴백
+        use_gpu = device == "gpu"
+        return PaddleOCR(lang="korean", use_angle_cls=True, use_gpu=use_gpu)
+
+ocr = _init_ocr()
 
 # ===== LLM 보조(선택) =====
-def llm_judge(details: dict, section_counts: list) -> dict:
+def llm_judge(details: dict, section_counts: list, *, llm_enabled: bool | None = None) -> dict:
     """
     LLM에 현재 OCR 체크 결과(세부 항목)를 넘기고,
     {decision: PASS|NEEDS_FIX|REJECT, findings:[{label,message}], reason?} 형태를 받는다.
-    호출 실패/키 누락 시에도 전체 로직에는 영향 없도록 보수적으로 처리.
+    - llm_enabled: True/False로 강제. None이면 ENV(LMM_ENABLED) 따라감.
+    - 비활성화 시 즉시 보수적 결과 반환(NEEDS_FIX).
     """
+    if llm_enabled is None:
+        llm_enabled = LLM_ENABLED_DEFAULT
+    if not llm_enabled:
+        return {"decision": "NEEDS_FIX", "findings": []}
+
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return {"decision": "NEEDS_FIX", "findings": []}
@@ -51,13 +80,10 @@ def llm_judge(details: dict, section_counts: list) -> dict:
             "NEEDS_FIX인 경우 findings 배열에 수정 필요 항목을 넣고, "
             "REJECT면 reason을 간단 명료하게 넣습니다."
         )
-        user_payload = {
-            "details": details,
-            "section_counts": section_counts
-        }
+        user_payload = {"details": details, "section_counts": section_counts}
         messages = [
             {"role": "system", "content": system},
-            {"role": "user", "content": f"아래 데이터를 보고 판정하세요. 반드시 JSON만 반환:\n{json.dumps(user_payload, ensure_ascii=False)}"}
+            {"role": "user", "content": f"아래 데이터를 보고 판정하세요. 반드시 JSON만 반환:\n{json.dumps(user_payload, ensure_ascii=False)}"},
         ]
 
         resp = client.chat.completions.create(
@@ -67,7 +93,7 @@ def llm_judge(details: dict, section_counts: list) -> dict:
         )
         text = resp.choices[0].message.content.strip()
         start, end = text.find("{"), text.rfind("}")
-        parsed = json.loads(text[start:end+1]) if start != -1 and end != -1 else {}
+        parsed = json.loads(text[start:end + 1]) if start != -1 and end != -1 else {}
     except Exception:
         return {"decision": "NEEDS_FIX", "findings": []}
 
@@ -93,7 +119,7 @@ def extract_ocr_items(img):
     PaddleOCR.ocr() 결과를 (text, confidence, bbox) 리스트로 통일
     bbox: [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
     """
-    raw = ocr.ocr(img)  
+    raw = ocr.ocr(img)
     page = raw[0] if raw and raw[0] else []
 
     results = []
@@ -107,9 +133,9 @@ def extract_ocr_items(img):
                     results.append((text, conf, bbox))
         elif isinstance(line, dict):
             # 일부 버전 dict 변형 포맷 방어
-            bbox = line.get('points') or line.get('bbox')
-            text = line.get('text')
-            conf = line.get('score')
+            bbox = line.get("points") or line.get("bbox")
+            text = line.get("text")
+            conf = line.get("score")
             if bbox is not None and text is not None and conf is not None:
                 results.append((text, conf, bbox))
     return results
@@ -149,11 +175,11 @@ def check_photo_at_fixed_location(img, debug=False):
     """
     고정 좌표 영역을 분석하여 사진 유무 판별 (템플릿 문서에 맞춘 좌표; mm 단위 예시)
     """
-    PHOTO_AREA_MM = {'x': 15, 'y': 20, 'w': 30, 'h': 40}
-    x1 = int((PHOTO_AREA_MM['x'] / 25.4) * DPI)
-    y1 = int((PHOTO_AREA_MM['y'] / 25.4) * DPI)
-    x2 = x1 + int((PHOTO_AREA_MM['w'] / 25.4) * DPI)
-    y2 = y1 + int((PHOTO_AREA_MM['h'] / 25.4) * DPI)
+    PHOTO_AREA_MM = {"x": 15, "y": 20, "w": 30, "h": 40}
+    x1 = int((PHOTO_AREA_MM["x"] / 25.4) * DPI)
+    y1 = int((PHOTO_AREA_MM["y"] / 25.4) * DPI)
+    x2 = x1 + int((PHOTO_AREA_MM["w"] / 25.4) * DPI)
+    y2 = y1 + int((PHOTO_AREA_MM["h"] / 25.4) * DPI)
 
     if debug:
         print(f"[PHOTO] ROI px=({x1},{y1})~({x2},{y2})")
@@ -183,8 +209,8 @@ def get_applicant_name_hybrid(pdf_path, ocr_page1_items, debug=False):
     """
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            p1_text = pdf.pages[0].extract_text() or ''
-            match = re.search(r'성\s*명\s*(?:\(한글\))?\s*([가-힣]{2,5})', p1_text)
+            p1_text = pdf.pages[0].extract_text() or ""
+            match = re.search(r"성\s*명\s*(?:\(한글\))?\s*([가-힣]{2,5})", p1_text)
             if match:
                 name = match.group(1).strip()
                 if debug:
@@ -194,7 +220,7 @@ def get_applicant_name_hybrid(pdf_path, ocr_page1_items, debug=False):
         pass
 
     full_ocr_text = " ".join([item[0] for item in ocr_page1_items])
-    match = re.search(r'성\s*명\s*(?:\(한글\))?\s*([가-힣]{2,5})', full_ocr_text)
+    match = re.search(r"성\s*명\s*(?:\(한글\))?\s*([가-힣]{2,5})", full_ocr_text)
     if match:
         name = match.group(1).strip()
         if debug:
@@ -210,19 +236,19 @@ def check_consent_hybrid(pdf_path, ocr_page3_items, debug=False):
     """
     3페이지에서 '동의하십니까?(예)' 패턴 확인: 먼저 pdfplumber → 미검출 시 OCR 텍스트
     """
-    consent_pattern = r'동의하십니까\?\s*\(\s*예\s*\)'
+    consent_pattern = r"동의하십니까\?\s*\(\s*예\s*\)"
     try:
         with pdfplumber.open(pdf_path) as pdf:
             if len(pdf.pages) >= 3:
-                p3_text = pdf.pages[2].extract_text() or ''
-                if re.search(consent_pattern, re.sub(r'\s+', '', p3_text)):
+                p3_text = pdf.pages[2].extract_text() or ""
+                if re.search(consent_pattern, re.sub(r"\s+", "", p3_text)):
                     if debug:
                         print("[CONSENT] Digital Text Match")
                     return True, "Digital Text Match"
     except Exception:
         pass
 
-    full_ocr_text = re.sub(r'\s+', '', "".join([item[0] for item in ocr_page3_items]))
+    full_ocr_text = re.sub(r"\s+", "", "".join([item[0] for item in ocr_page3_items]))
     if full_ocr_text and re.search(consent_pattern, full_ocr_text):
         if debug:
             print("[CONSENT] OCR Text Match")
@@ -250,7 +276,7 @@ def detect_signature_enhanced_ocr(page_items, applicant_name, img_shape):
     if not page_items:
         return False, None
 
-    anchor_words = ('성명', '서명', '신청인')
+    anchor_words = ("성명", "서명", "신청인")
     has_anchor = any(any(a in t for a in anchor_words) for t, _, _ in page_items)
     name_seen = any((applicant_name and applicant_name in t) for t, _, _ in page_items)
     return (has_anchor and name_seen), "OCR proximity"
@@ -275,7 +301,7 @@ def detect_signature_ultimate(pdf_path, page_num, img, page_items, applicant_nam
                 anchor_box, anchor_index = None, -1
                 for i, w in enumerate(words):
                     if applicant_name in w.get("text", ""):
-                        ctx = "".join(x.get("text", "") for x in words[max(0, i - 3):i + 1])
+                        ctx = "".join(x.get("text", "") for x in words[max(0, i - 3): i + 1])
                         if "성명" in ctx or "서명" in ctx:
                             anchor_box, anchor_index = w, i
                             break
@@ -285,7 +311,7 @@ def detect_signature_ultimate(pdf_path, page_num, img, page_items, applicant_nam
                     next_word_text = ""
                     if len(words) > anchor_index + 1:
                         nextw = words[anchor_index + 1]
-                        if abs(nextw['top'] - anchor_box['top']) < 5:
+                        if abs(nextw["top"] - anchor_box["top"]) < 5:
                             next_word_text = nextw.get("text", "")
 
                     if next_word_text and next_word_text not in ["(인)", "(서명)"]:
@@ -295,10 +321,12 @@ def detect_signature_ultimate(pdf_path, page_num, img, page_items, applicant_nam
 
                     # 임베디드 이미지로 서명했는지 검사
                     for p_img in page_bottom.images:
-                        if (p_img["x0"] < anchor_box["x1"] + 150 and
-                            p_img["x1"] > anchor_box["x1"] and
-                            p_img["top"] < anchor_box["bottom"] and
-                            p_img["bottom"] > anchor_box["top"]):
+                        if (
+                            p_img["x0"] < anchor_box["x1"] + 150
+                            and p_img["x1"] > anchor_box["x1"]
+                            and p_img["top"] < anchor_box["bottom"]
+                            and p_img["bottom"] > anchor_box["top"]
+                        ):
                             if debug:
                                 print(f"[SIGN{page_num}] embedded image signature")
                             return True, "PDF Embedded Image"
@@ -314,7 +342,7 @@ def detect_signature_ultimate(pdf_path, page_num, img, page_items, applicant_nam
                     ry1 = int(anchor_box["top"] * scale) - 20
                     rx2 = rx1 + 250
                     ry2 = int(anchor_box["bottom"] * scale) + 20
-                    roi = img[max(0, ry1):min(img.shape[0], ry2), max(0, rx1):min(img.shape[1], rx2)]
+                    roi = img[max(0, ry1): min(img.shape[0], ry2), max(0, rx1): min(img.shape[1], rx2)]
                     if roi.size > 0:
                         sig_score = analyze_signature_image(roi)
                         if debug:
@@ -334,21 +362,24 @@ def detect_signature_ultimate(pdf_path, page_num, img, page_items, applicant_nam
 
 
 # ===== 메인 함수 =====
-def review_document(pdf_path: str, debug: bool = False) -> dict:
+def review_document(pdf_path: str, debug: bool = False, *, ocr_device: str | None = None, llm_enabled: bool | None = None) -> dict:
     """
     입력: 저장된 PDF 파일 경로
-    반환: (이전 버전과 호환) {
-      "status": PASS|FAIL,
-      "processing_time": "1.23s",
-      "details": {...},
-      "section_counts": [...],
-      # 참고용:
-      "verdict_llm": PASS|NEEDS_FIX|REJECT|None,
-      "findings_llm": [{label,message}],
-      "reason_llm": str|None
-    }
+    옵션:
+      - ocr_device: 'cpu'|'gpu' (None이면 ENV/OCR_DEVICE 사용)
+      - llm_enabled: True|False (None이면 ENV/LLM_ENABLED 사용)
+    반환: (이전 버전과 호환)
     """
     start = time.perf_counter()
+
+    # ── (선택) 디바이스 변경이 들어오면 런타임에서 OCR 재초기화 ─────────────
+    global ocr
+    if ocr_device:
+        desired = ocr_device.strip().lower()
+        current = OCR_DEVICE_DEFAULT
+        # 장시간 서버에서 동적으로 바꾸고 싶을 수 있으니, 장치가 다르면 재초기화
+        if desired != current:
+            ocr = _init_ocr(desired)
 
     # 1) PDF → 이미지 (Poppler → PyMuPDF 폴백)
     try:
@@ -398,7 +429,7 @@ def review_document(pdf_path: str, debug: bool = False) -> dict:
     try:
         if len(imgs) >= 2:
             reader = PdfReader(pdf_path)
-            raw2 = reader.pages[1].extract_text() or ''
+            raw2 = reader.pages[1].extract_text() or ""
             section_lengths = count_sections(raw2)
 
             # OCR 폴백(텍스트 추출 실패/부족 시)
@@ -410,7 +441,7 @@ def review_document(pdf_path: str, debug: bool = False) -> dict:
     except Exception:
         section_lengths, section_flags = [], []
 
-    # 7) 규칙 기반 최종 판정 (이전 버전과 동일)
+    # 7) 규칙 기반 최종 판정
     requirements = [
         applicant_name is not None,
         photo_ok,
@@ -420,10 +451,9 @@ def review_document(pdf_path: str, debug: bool = False) -> dict:
         sig3_ok,
     ]
     rule_pass = all(requirements)
-
     status_by_rule = "PASS" if rule_pass else "FAIL"
 
-    # 8) 상세 정보(프론트/로그용)
+    # 8) 상세 정보
     details = {
         "지원자명": applicant_name if applicant_name else "❌ 미확인",
         "사진": "✅ 확인됨" if photo_ok else "❌ 누락",
@@ -438,20 +468,18 @@ def review_document(pdf_path: str, debug: bool = False) -> dict:
     }
 
     section_counts = [
-        {"label": f"섹션{i+1}", "count": cnt, "length": cnt}
+        {"label": f"섹션{i + 1}", "count": cnt, "length": cnt}
         for i, cnt in enumerate(section_lengths)
     ]
 
-        # 9) LLM 보조 + 최종 verdict 도출
+    # 9) LLM 보조 + 최종 verdict 도출 (옵션)
     verdict_llm, findings_llm, reason_llm = None, [], None
 
     if rule_pass:
-        # 규칙 통과 → 그대로 PASS
         verdict = "PASS"
         findings = []
         reason = None
     else:
-        # 규칙으로 미달된 항목들 힌트(seed)
         findings_seed = []
         if applicant_name is None:
             findings_seed.append({"label": "성명", "message": "1페이지 성명 인식 실패"})
@@ -466,22 +494,18 @@ def review_document(pdf_path: str, debug: bool = False) -> dict:
         if not sig3_ok:
             findings_seed.append({"label": "서명(3p)", "message": "서명 영역에서 서명 미검출"})
 
-        # LLM 보조(참고 메타도 함께 노출)
-        llm = llm_judge(details, section_counts)
+        llm = llm_judge(details, section_counts, llm_enabled=llm_enabled)
         verdict_llm = llm.get("decision")
         findings_llm = llm.get("findings", [])
         reason_llm = llm.get("reason")
 
-        # 최종 verdict: LLM이 NEEDS_FIX/REJECT를 줄 때만 수용, 아니면 NEEDS_FIX
         verdict = verdict_llm if verdict_llm in ("NEEDS_FIX", "REJECT") else "NEEDS_FIX"
-        # LLM이 공란이면 seed 사용
         findings = findings_llm if findings_llm else findings_seed
         reason = reason_llm if verdict == "REJECT" else None
 
-    # 10) 응답 (백엔드/프론트 모두 호환)
+    # 10) 응답
     elapsed = f"{time.perf_counter() - start:.2f}s"
 
-    # 사람이 보기 쉬운 텍스트 로그 생성
     lines = [
         f"[요약] 규칙통과={rule_pass} (판정:{'PASS' if rule_pass else 'FAIL'})",
         f"- 지원자명: {details['지원자명']}",
@@ -496,17 +520,14 @@ def review_document(pdf_path: str, debug: bool = False) -> dict:
     debug_text = "\n".join(lines)
 
     return {
-        # 백엔드(OcrClient)가 파싱할 핵심 키
-        "verdict": verdict,        # PASS | NEEDS_FIX | REJECT
-        "findings": findings,      # [{label, message}]
-        "reason": reason,          # REJECT일 때 사유
-
-        # 프론트/로그용 메타
+        "verdict": verdict,          # PASS | NEEDS_FIX | REJECT
+        "findings": findings,        # [{label, message}]
+        "reason": reason,            # REJECT일 때 사유
         "status": "PASS" if verdict == "PASS" else "FAIL",
         "processing_time": elapsed,
         "details": details,
         "section_counts": section_counts,
-        "debug_text": debug_text, 
+        "debug_text": debug_text,
         "verdict_llm": verdict_llm,
         "findings_llm": findings_llm,
         "reason_llm": reason_llm,

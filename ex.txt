@@ -1,0 +1,24 @@
+.\venv\Scripts\activate.bat
+
+pip install -r requirements.txt
+
+ip uninstall -y paddlepaddle paddlepaddle-gpu
+
+
+python -m pip install paddlepaddle-gpu==2.6.2 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
+
+pip install "paddleocr<3"
+
+python - <<PY
+import paddle
+print("compiled_with_cuda:", paddle.is_compiled_with_cuda())
+paddle.utils.run_check()
+PY
+
+
+set OCR_DEVICE=gpu
+
+
+uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+
+http://localhost:8000/docs
